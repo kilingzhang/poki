@@ -2,9 +2,13 @@
 //!
 //! Shapes injected input after measured human movement instead of fixed
 //! schedules: minimum-jerk position profiles for reaches (Flash & Hogan 1985),
+//! Fitts-style duration pull toward human movement times, corrective
+//! submovements with an undershoot bias (Meyer et al. 1988; Elliott et al.
+//! 2004), flick velocity profiles with early lift-off for swipes and scrolls,
+//! curvature-weighted cadence in the spirit of the two-thirds power law,
 //! endpoint scatter that scales with movement speed (Schmidt et al. 1979),
-//! log-normal press and inter-key intervals, curved swipes with smooth drift,
-//! and per-frame deadline jitter so event cadence is never uniform.
+//! log-normal press and inter-key intervals with faster same-key bursts, and
+//! per-frame deadline jitter so event cadence is never uniform.
 //!
 //! Every plan function returns the exact legacy values when disabled, so
 //! callers keep one code path and tests stay deterministic.
@@ -43,6 +47,53 @@ const DRAG_MICRO_SIGMA_UNITS: f64 = 9.0;
 const END_SCATTER_BASE_UNITS: f64 = 30.0;
 const END_SCATTER_PER_SPEED_UNITS: f64 = 25.0;
 const END_SCATTER_MAX_UNITS: f64 = 500.0;
+
+/// Fitts-style aiming pull: touch movement time grows roughly linearly with
+/// log2(1 + distance/D0). The requested duration stays authoritative; the pull
+/// only nudges it toward the time a human would need for this distance.
+const FITTS_A_MS: f64 = 150.0;
+const FITTS_B_MS: f64 = 180.0;
+const FITTS_D0_UNITS: f64 = 3000.0;
+const FITTS_PULL_EXPONENT: f64 = 0.5;
+const FITTS_PULL_MIN: f64 = 0.72;
+const FITTS_PULL_MAX: f64 = 1.7;
+/// A reach with a hold or a long duration is an aiming drag; a short, fast,
+/// unhitched movement is a flick: the finger lifts early and OS inertia
+/// finishes the scroll (measured flicks reach peak velocity quickly and then
+/// slow down sharply before lift-off).
+const FLICK_MAX_DURATION_MS: u64 = 500;
+const FLICK_MIN_DISTANCE_UNITS: f64 = 4000.0;
+const FLICK_LIFT_MIN_FRACTION: f64 = 0.78;
+const FLICK_LIFT_MAX_FRACTION: f64 = 0.95;
+const FLICK_PEAK_MIN_FRACTION: f64 = 0.12;
+const FLICK_PEAK_MAX_FRACTION: f64 = 0.22;
+const FLICK_DECAY_MIN_TAU: f64 = 0.35;
+const FLICK_DECAY_MAX_TAU: f64 = 0.55;
+const FLICK_ARC_MIN_FRACTION: f64 = 0.002;
+const FLICK_ARC_MAX_FRACTION: f64 = 0.008;
+/// In-flight corrections after the primary submovement (Meyer et al. 1988;
+/// Elliott et al. 2004: humans undershoot more often than they overshoot).
+/// The correction covers most but not all of the miss, so the final error
+/// stays within the release scatter.
+const CORRECT_UNDERSHOOT_P: f64 = 0.25;
+const CORRECT_OVERSHOOT_P: f64 = 0.10;
+const CORRECT_UNDERSHOOT_MIN: f64 = 0.010;
+const CORRECT_UNDERSHOOT_MAX: f64 = 0.050;
+const CORRECT_OVERSHOOT_MIN: f64 = 0.004;
+const CORRECT_OVERSHOOT_MAX: f64 = 0.020;
+const CORRECT_COVER_MIN: f64 = 0.9;
+const CORRECT_COVER_MAX: f64 = 1.0;
+const CORRECT_LATENCY_MIN_MS: f64 = 50.0;
+const CORRECT_LATENCY_MAX_MS: f64 = 120.0;
+const CORRECT_MOVE_MIN_MS: f64 = 40.0;
+const CORRECT_MOVE_MAX_MS: f64 = 90.0;
+/// Two-thirds power law flavor: cadence slows on the tightest path segments
+/// (curvature-weighted frame deadlines, capped so minimum-jerk stays dominant).
+const CURVATURE_WARP_MAX: f64 = 0.30;
+/// Repeated presses of the same key speed up (burst behavior).
+const KEY_REPEAT_MEDIAN_FACTOR: f64 = 0.72;
+const KEY_REPEAT_DECAY: f64 = 0.94;
+const KEY_REPEAT_MIN_MS: u64 = 70;
 
 const PINCH_TOTAL_MIN_FACTOR: f64 = 0.9;
 const PINCH_TOTAL_MAX_FACTOR: f64 = 1.15;
@@ -131,12 +182,14 @@ impl Humanize {
         if let Some(spare) = self.spare_normal.take() {
             return spare;
         }
-        // Box-Muller; u1 must be > 0 to avoid log(0).
+        // Box-Muller; u1 must be > 0 to avoid log(0). The spare partner uses
+        // the SAME angle: sin(angle) is symmetric, while sin(angle / 2) on
+        // [0, 2*pi) is always non-negative and would skew every distribution.
         let u1 = self.uniform().max(f64::MIN_POSITIVE);
         let u2 = self.uniform();
         let magnitude = (-2.0 * u1.ln()).sqrt();
         let angle = std::f64::consts::TAU * u2;
-        self.spare_normal = Some(magnitude * (angle * 0.5).sin());
+        self.spare_normal = Some(magnitude * angle.sin());
         magnitude * angle.cos()
     }
 
@@ -215,9 +268,270 @@ pub(crate) struct DragPlan {
     pub frames: Vec<(u16, u16, u64)>,
 }
 
-/// A drag or scroll: minimum-jerk timing along the chord, a slow lateral arc,
-/// smooth drift and per-frame micro jitter, jittered frame deadlines, and
-/// endpoint scatter that grows with peak speed.
+/// Minimum-jerk position profile: 10t^3 - 15t^4 + 6t^5 (Flash & Hogan 1985).
+fn min_jerk(t: f64) -> f64 {
+    let t2 = t * t;
+    t2 * t * (10.0 - 15.0 * t + 6.0 * t2)
+}
+
+/// Jittered per-step deadlines. `weights` skews the cadence (curvature
+/// slowdown); per-frame jitter breaks uniformity; renormalization keeps the
+/// last deadline at total_ms with strictly increasing values.
+fn jittered_deadlines(h: &mut Humanize, total_ms: u64, steps: usize, weights: &[f64]) -> Vec<u64> {
+    let mut dts = Vec::with_capacity(steps);
+    let mut weighted_sum = 0.0;
+    for index in 0..steps {
+        let weight = weights.get(index).copied().unwrap_or(1.0);
+        let dt = total_ms as f64 / steps as f64
+            * weight
+            * h.uniform_range(DRAG_FRAME_DT_MIN_FACTOR, DRAG_FRAME_DT_MAX_FACTOR);
+        weighted_sum += dt;
+        dts.push(dt);
+    }
+    let mut deadlines = Vec::with_capacity(steps);
+    let mut elapsed = 0.0;
+    for dt in &mut dts {
+        *dt *= total_ms as f64 / weighted_sum;
+        elapsed += *dt;
+        deadlines.push((elapsed.round().max(1.0) as u64).min(total_ms));
+    }
+    // Restore strict monotonicity after rounding (defensive; per-frame gaps
+    // are >= ~10 ms so rounding cannot collapse them).
+    for index in 1..deadlines.len() {
+        if deadlines[index] <= deadlines[index - 1] {
+            deadlines[index] = deadlines[index - 1] + 1;
+        }
+    }
+    deadlines
+}
+
+/// Curvature-weighted cadence approximation of the two-thirds power law
+/// (Lacquaniti et al. 1983): tangential speed drops on tighter segments.
+/// Weights stay in [1, 1 + CURVATURE_WARP_MAX], so straight paths keep the
+/// plain minimum-jerk cadence.
+fn curvature_weights(points: &[(f64, f64)]) -> Vec<f64> {
+    if points.len() < 3 {
+        return Vec::new();
+    }
+    let mut curvatures = Vec::with_capacity(points.len());
+    for window in points.windows(3) {
+        let (a, b, c) = (window[0], window[1], window[2]);
+        let ux = b.0 - a.0;
+        let uy = b.1 - a.1;
+        let vx = c.0 - b.0;
+        let vy = c.1 - b.1;
+        let d1 = ux.hypot(uy);
+        let d2 = vx.hypot(vy);
+        let k = if d1 > 1e-9 && d2 > 1e-9 {
+            2.0 * (ux * vy - uy * vx).abs() / (d1 * d2 * (d1 + d2))
+        } else {
+            0.0
+        };
+        curvatures.push(k);
+    }
+    let max = curvatures.iter().cloned().fold(0.0, f64::max).max(1e-9);
+    let mut weights = vec![1.0];
+    for k in &curvatures {
+        let normalized = (k / max).clamp(0.0, 1.0);
+        weights.push(1.0 + CURVATURE_WARP_MAX * normalized.powf(1.0 / 3.0));
+    }
+    weights.push(1.0);
+    weights
+}
+
+fn end_scatter_sigma(speed_units_per_s: f64) -> f64 {
+    (END_SCATTER_BASE_UNITS + END_SCATTER_PER_SPEED_UNITS * speed_units_per_s)
+        .min(END_SCATTER_MAX_UNITS)
+}
+
+/// Aiming reach: Fitts-pulled duration, minimum-jerk chord progress with a
+/// lateral arc and drift, curvature-weighted cadence, an optional corrective
+/// submovement after the primary reach, and a Schmidt-scattered release.
+#[allow(clippy::type_complexity)]
+fn aiming_drag(
+    h: &mut Humanize,
+    x1: u16,
+    y1: u16,
+    dx: f64,
+    dy: f64,
+    distance: f64,
+    duration_ms: u64,
+) -> (u64, Vec<(u16, u16, u64)>, (u16, u16), &'static str, serde_json::Value) {
+    let fitts_ms = FITTS_A_MS + FITTS_B_MS * (1.0 + distance / FITTS_D0_UNITS).log2();
+    let pull = (fitts_ms / (duration_ms.max(1) as f64))
+        .powf(FITTS_PULL_EXPONENT)
+        .clamp(FITTS_PULL_MIN, FITTS_PULL_MAX);
+    let base_ms = ((duration_ms as f64 * pull) as u64).clamp(80, 60000);
+    let total_ms = scale_duration(h, base_ms, DRAG_TOTAL_MIN_FACTOR, DRAG_TOTAL_MAX_FACTOR);
+
+    let arc = distance * h.uniform_range(DRAG_ARC_MIN_FRACTION, DRAG_ARC_MAX_FRACTION)
+        * if h.uniform() < 0.5 { -1.0 } else { 1.0 };
+    let noise_slow_amplitude = distance * h.uniform_range(0.002, 0.005);
+    let noise_fast_amplitude = distance * h.uniform_range(0.001, 0.003);
+    let noise_slow_freq = h.uniform_range(0.5, 1.8);
+    let noise_fast_freq = h.uniform_range(0.8, 2.6);
+    let noise_slow_phase = h.uniform() * std::f64::consts::TAU;
+    let noise_fast_phase = h.uniform() * std::f64::consts::TAU;
+    // Perpendicular direction of travel.
+    let (perp_x, perp_y) = (-dy / distance, dx / distance);
+
+    // Primary submovement plus optional in-flight correction. The correction
+    // covers most (undershoot) or part (overshoot pull-back) of the miss, so
+    // the residual error stays inside the release scatter.
+    let roll = h.uniform();
+    let (main_fraction, correction_units) = if roll < CORRECT_UNDERSHOOT_P {
+        let miss = distance * h.uniform_range(CORRECT_UNDERSHOOT_MIN, CORRECT_UNDERSHOOT_MAX);
+        (1.0 - miss / distance, miss * h.uniform_range(CORRECT_COVER_MIN, CORRECT_COVER_MAX))
+    } else if roll < CORRECT_UNDERSHOOT_P + CORRECT_OVERSHOOT_P {
+        let over = distance * h.uniform_range(CORRECT_OVERSHOOT_MIN, CORRECT_OVERSHOOT_MAX);
+        (1.0 + over / distance, -over * h.uniform_range(0.5, 0.9))
+    } else {
+        (1.0, 0.0)
+    };
+
+    let steps = total_ms.div_ceil(16).max(1) as usize;
+    // Idealized path (chord progress + arc) for curvature weighting.
+    let ideal: Vec<(f64, f64)> = (0..=steps)
+        .map(|index| {
+            let t = index as f64 / steps as f64;
+            let lateral = arc * (std::f64::consts::PI * t).sin();
+            (x1 as f64 + dx * min_jerk(t) + perp_x * lateral, y1 as f64 + dy * min_jerk(t) + perp_y * lateral)
+        })
+        .collect();
+    let weights = curvature_weights(&ideal);
+    let deadlines = jittered_deadlines(h, total_ms, steps, &weights);
+
+    // Peak speed of the minimum-jerk profile is 1.875 * amplitude / duration.
+    let peak_speed = 1.875 * distance / (total_ms as f64 / 1000.0);
+
+    let mut frames = Vec::with_capacity(steps + 8);
+    for (index, &at_ms) in deadlines.iter().enumerate() {
+        let t = (index + 1) as f64 / steps as f64;
+        let lateral = arc * (std::f64::consts::PI * t).sin()
+            + noise_slow_amplitude * (std::f64::consts::TAU * noise_slow_freq * t + noise_slow_phase).sin()
+            + noise_fast_amplitude * (std::f64::consts::TAU * noise_fast_freq * t + noise_fast_phase).sin();
+        let jitter_x = h.normal() * DRAG_MICRO_SIGMA_UNITS;
+        let jitter_y = h.normal() * DRAG_MICRO_SIGMA_UNITS;
+        let x = x1 as f64 + dx * min_jerk(t) * main_fraction + perp_x * lateral + jitter_x;
+        let y = y1 as f64 + dy * min_jerk(t) * main_fraction + perp_y * lateral + jitter_y;
+        frames.push((clamp_coord(x), clamp_coord(y), at_ms));
+    }
+
+    let release;
+    let correction_record;
+    if correction_units.abs() >= 1.0 {
+        // Corrective submovement: slower, hence tighter (Schmidt tradeoff).
+        let latency = h.uniform_range(CORRECT_LATENCY_MIN_MS, CORRECT_LATENCY_MAX_MS);
+        let corr_ms = h.uniform_range(CORRECT_MOVE_MIN_MS, CORRECT_MOVE_MAX_MS);
+        let corr_steps = (corr_ms / 16.0).ceil().max(2.0) as usize;
+        let corr_peak_speed = 1.875 * correction_units.abs() / (corr_ms / 1000.0);
+        let corr_sigma = end_scatter_sigma(corr_peak_speed);
+        let mut elapsed = total_ms as f64 + latency;
+        let mut last_at = total_ms;
+        for step in 1..=corr_steps {
+            let t = step as f64 / corr_steps as f64;
+            elapsed += corr_ms / corr_steps as f64
+                * h.uniform_range(DRAG_FRAME_DT_MIN_FACTOR, DRAG_FRAME_DT_MAX_FACTOR);
+            let at = (elapsed.round() as u64).max(last_at + 1);
+            last_at = at;
+            let jitter_x = h.normal() * DRAG_MICRO_SIGMA_UNITS;
+            let jitter_y = h.normal() * DRAG_MICRO_SIGMA_UNITS;
+            let x = x1 as f64 + dx * (main_fraction + correction_units / distance * min_jerk(t))
+                + jitter_x;
+            let y = y1 as f64 + dy * (main_fraction + correction_units / distance * min_jerk(t))
+                + jitter_y;
+            frames.push((clamp_coord(x), clamp_coord(y), at));
+        }
+        let (last_x, last_y) = {
+            let frame = *frames.last().expect("correction frames appended");
+            (frame.0, frame.1)
+        };
+        release = h.jitter_point(last_x, last_y, corr_sigma, END_SCATTER_MAX_UNITS);
+        correction_record = json!({
+            "kind": if correction_units > 0.0 { "undershoot" } else { "overshoot" },
+            "units": correction_units.round(),
+            "latency_ms": latency.round(),
+            "move_ms": corr_ms.round(),
+        });
+    } else {
+        // Release lands near the final frame with speed-scaled scatter.
+        let (last_x, last_y, _) = frames.last().copied().unwrap_or((x1, y1, total_ms));
+        release = h.jitter_point(last_x, last_y, end_scatter_sigma(peak_speed), END_SCATTER_MAX_UNITS);
+        correction_record = serde_json::Value::Null;
+    }
+    (total_ms, frames, release, "aiming", correction_record)
+}
+
+/// Flick: contact time is short and roughly independent of distance; velocity
+/// peaks early and decays before lift-off, so the release happens mid-gesture
+/// and OS inertia carries the content the rest of the way.
+#[allow(clippy::type_complexity)]
+fn flick_drag(
+    h: &mut Humanize,
+    x1: u16,
+    y1: u16,
+    dx: f64,
+    dy: f64,
+    distance: f64,
+    duration_ms: u64,
+) -> (u64, Vec<(u16, u16, u64)>, (u16, u16), &'static str, serde_json::Value) {
+    let contact_ms = scale_duration(h, duration_ms, 0.85, 1.05);
+    let lift = h.uniform_range(FLICK_LIFT_MIN_FRACTION, FLICK_LIFT_MAX_FRACTION);
+    let peak_t = h.uniform_range(FLICK_PEAK_MIN_FRACTION, FLICK_PEAK_MAX_FRACTION);
+    let tau = h.uniform_range(FLICK_DECAY_MIN_TAU, FLICK_DECAY_MAX_TAU);
+    let arc = distance * h.uniform_range(FLICK_ARC_MIN_FRACTION, FLICK_ARC_MAX_FRACTION)
+        * if h.uniform() < 0.5 { -1.0 } else { 1.0 };
+    let noise_amplitude = distance * h.uniform_range(0.001, 0.003);
+    let noise_freq = h.uniform_range(0.8, 2.2);
+    let noise_phase = h.uniform() * std::f64::consts::TAU;
+    let (perp_x, perp_y) = (-dy / distance, dx / distance);
+    let steps = contact_ms.div_ceil(16).max(4) as usize;
+    // Normalized velocity shape: smooth rise to peak, exponential decay.
+    let mut shape = Vec::with_capacity(steps + 1);
+    let mut cumulative = 0.0;
+    for index in 0..=steps {
+        let t = index as f64 / steps as f64;
+        let rise_x = (t / peak_t).min(1.0);
+        let rise = rise_x * rise_x * (3.0 - 2.0 * rise_x);
+        let decay = (-(t - peak_t).max(0.0) / tau).exp();
+        cumulative += rise * decay;
+        shape.push(cumulative);
+    }
+    let total_shape = *shape.last().expect("shape always has steps + 1 entries");
+    for value in &mut shape {
+        *value /= total_shape;
+    }
+    let deadlines = jittered_deadlines(h, contact_ms, steps, &[]);
+    let mut frames = Vec::with_capacity(steps);
+    for (index, &at_ms) in deadlines.iter().enumerate() {
+        let t = (index + 1) as f64 / steps as f64;
+        let progress = shape[index + 1] * lift;
+        let lateral = arc * (std::f64::consts::PI * t).sin()
+            + noise_amplitude * (std::f64::consts::TAU * noise_freq * t + noise_phase).sin();
+        let jitter_x = h.normal() * DRAG_MICRO_SIGMA_UNITS;
+        let jitter_y = h.normal() * DRAG_MICRO_SIGMA_UNITS;
+        let x = x1 as f64 + dx * progress + perp_x * lateral + jitter_x;
+        let y = y1 as f64 + dy * progress + perp_y * lateral + jitter_y;
+        frames.push((clamp_coord(x), clamp_coord(y), at_ms));
+    }
+    // Numerical peak speed (per-step displacement) for Schmidt scatter.
+    let peak_step = shape.windows(2).map(|pair| pair[1] - pair[0]).fold(0.0, f64::max);
+    let peak_speed = peak_step * lift * distance / ((contact_ms / steps as u64) as f64 / 1000.0);
+    let (last_x, last_y, _) = frames.last().copied().unwrap_or((x1, y1, contact_ms));
+    let release = h.jitter_point(last_x, last_y, end_scatter_sigma(peak_speed), END_SCATTER_MAX_UNITS);
+    let record = json!({
+        "lift_fraction": (lift * 100.0).round() / 100.0,
+        "peak_t": (peak_t * 100.0).round() / 100.0,
+        "tau": (tau * 100.0).round() / 100.0,
+    });
+    (contact_ms, frames, release, "flick", record)
+}
+
+/// A drag or scroll. Aiming reaches (hold, long duration, or short distance)
+/// use minimum-jerk timing with Fitts-style duration pull, a lateral arc,
+/// curvature-weighted cadence, and corrective submovements. Fast unhitched
+/// movements are flicks: early velocity peak, decay, and lift before the
+/// gesture ends. Endpoint scatter grows with peak speed (Schmidt et al. 1979).
 pub(crate) fn drag_plan(
     h: &mut Humanize,
     x1: u16,
@@ -237,7 +551,6 @@ pub(crate) fn drag_plan(
             frames: Vec::new(),
         };
     }
-    let total_ms = scale_duration(h, duration_ms, DRAG_TOTAL_MIN_FACTOR, DRAG_TOTAL_MAX_FACTOR);
     let hold = scale_duration(h, hold_ms, DRAG_HOLD_MIN_FACTOR, DRAG_HOLD_MAX_FACTOR);
     let end_hold = scale_duration(h, end_hold_ms, DRAG_END_HOLD_MIN_FACTOR, DRAG_END_HOLD_MAX_FACTOR);
     let contact = h.jitter_point(x1, y1, DRAG_START_SIGMA_UNITS, TAP_START_MAX_UNITS);
@@ -245,74 +558,26 @@ pub(crate) fn drag_plan(
     let dx = f64::from(x2) - f64::from(x1);
     let dy = f64::from(y2) - f64::from(y1);
     let distance = dx.hypot(dy).max(1.0);
-    let steps = total_ms.div_ceil(16).max(1) as usize;
-    // Per-frame cadence jitter, then renormalized so the last deadline stays total_ms.
-    let mut deadlines = Vec::with_capacity(steps);
-    let mut sum = 0.0;
-    for _ in 0..steps {
-        let dt = total_ms as f64 / steps as f64
-            * h.uniform_range(DRAG_FRAME_DT_MIN_FACTOR, DRAG_FRAME_DT_MAX_FACTOR);
-        sum += dt;
-        deadlines.push(dt);
-    }
-    let mut elapsed = 0.0;
-    for dt in &mut deadlines {
-        *dt *= total_ms as f64 / sum;
-        elapsed += *dt;
-        let rounded = elapsed.round().max(1.0) as u64;
-        *dt = rounded.min(total_ms) as f64;
-    }
-    // Restore strict monotonicity after rounding (defensive; per-frame gaps
-    // are >= ~10 ms so rounding cannot collapse them).
-    for index in 1..deadlines.len() {
-        if deadlines[index] <= deadlines[index - 1] {
-            deadlines[index] = deadlines[index - 1] + 1.0;
-        }
-    }
-
-    let arc = distance * h.uniform_range(DRAG_ARC_MIN_FRACTION, DRAG_ARC_MAX_FRACTION)
-        * if h.uniform() < 0.5 { -1.0 } else { 1.0 };
-    let noise_slow_amplitude = distance * h.uniform_range(0.002, 0.005);
-    let noise_fast_amplitude = distance * h.uniform_range(0.001, 0.003);
-    let noise_slow_freq = h.uniform_range(0.5, 1.8);
-    let noise_fast_freq = h.uniform_range(0.8, 2.6);
-    let noise_slow_phase = h.uniform() * std::f64::consts::TAU;
-    let noise_fast_phase = h.uniform() * std::f64::consts::TAU;
-    // Perpendicular direction of travel.
-    let (perp_x, perp_y) = (-dy / distance, dx / distance);
-    // Peak speed of the minimum-jerk profile is 1.875 * distance / duration.
-    let peak_speed = 1.875 * distance / (total_ms as f64 / 1000.0);
-    let end_sigma = (END_SCATTER_BASE_UNITS + END_SCATTER_PER_SPEED_UNITS * peak_speed)
-        .min(END_SCATTER_MAX_UNITS);
-
-    let mut frames = Vec::with_capacity(steps);
-    for (index, &at_ms) in deadlines.iter().enumerate() {
-        let t = (index + 1) as f64 / steps as f64;
-        // Minimum-jerk position profile: 10t^3 - 15t^4 + 6t^5.
-        let s = 10.0 * t * t * t - 15.0 * t * t * t * t + 6.0 * t * t * t * t * t;
-        let lateral = arc * (std::f64::consts::PI * t).sin()
-            + noise_slow_amplitude * (std::f64::consts::TAU * noise_slow_freq * t + noise_slow_phase).sin()
-            + noise_fast_amplitude * (std::f64::consts::TAU * noise_fast_freq * t + noise_fast_phase).sin();
-        let jitter_x = h.normal() * DRAG_MICRO_SIGMA_UNITS;
-        let jitter_y = h.normal() * DRAG_MICRO_SIGMA_UNITS;
-        let x = x1 as f64 + dx * s + perp_x * lateral + jitter_x;
-        let y = y1 as f64 + dy * s + perp_y * lateral + jitter_y;
-        frames.push((clamp_coord(x), clamp_coord(y), at_ms.round() as u64));
-    }
-    // Release lands near the final frame with speed-scaled scatter.
-    let (last_x, last_y, _) = frames.last().copied().unwrap_or((x2, y2, total_ms));
-    let release = h.jitter_point(last_x, last_y, end_sigma, END_SCATTER_MAX_UNITS);
+    let aiming = hold_ms > 0
+        || duration_ms > FLICK_MAX_DURATION_MS
+        || distance < FLICK_MIN_DISTANCE_UNITS;
+    let (total_ms, frames, release, profile, correction) = if aiming {
+        aiming_drag(h, x1, y1, dx, dy, distance, duration_ms)
+    } else {
+        flick_drag(h, x1, y1, dx, dy, distance, duration_ms)
+    };
 
     h.record(json!({
         "op": "drag",
         "request": [x1, y1, x2, y2, duration_ms],
+        "profile": profile,
         "contact": [contact.0, contact.1],
         "release": [release.0, release.1],
         "hold_ms": hold,
         "end_hold_ms": end_hold,
         "total_ms": total_ms,
         "frames": frames.len(),
-        "end_sigma": end_sigma.round(),
+        "correction": correction,
     }));
     DragPlan { contact, release, hold_ms: hold, end_hold_ms: end_hold, frames }
 }
@@ -385,6 +650,19 @@ pub(crate) fn key_hold_ms(h: &mut Humanize) -> u64 {
 
 pub(crate) fn key_gap_ms(h: &mut Humanize) -> u64 {
     if !h.enabled { 50 } else { h.lognormal_ms(KEY_GAP_MEDIAN_MS, KEY_GAP_SIGMA, KEY_GAP_MIN_MS, KEY_GAP_MAX_MS) }
+}
+
+/// Gap before a repeated press of the same key (`press_key` with count > 1):
+/// bursts start faster than isolated keystrokes and settle slightly quicker.
+pub(crate) fn key_repeat_gap_ms(h: &mut Humanize, repeat_index: usize) -> u64 {
+    if !h.enabled {
+        50
+    } else {
+        let shrink = KEY_REPEAT_MEDIAN_FACTOR
+            * KEY_REPEAT_DECAY.powi(repeat_index.saturating_sub(1) as i32);
+        let median = (KEY_GAP_MEDIAN_MS * shrink).max(KEY_REPEAT_MIN_MS as f64);
+        h.lognormal_ms(median, KEY_GAP_SIGMA, KEY_REPEAT_MIN_MS, KEY_GAP_MAX_MS)
+    }
 }
 
 pub(crate) fn modifier_lead_ms(h: &mut Humanize) -> u64 {
@@ -496,7 +774,9 @@ mod tests {
             assert!(at_ms > last, "deadline {at_ms} not after {last}");
             last = at_ms;
         }
-        assert_between(last, 650, 1000, "drag total");
+        // Fitts pull for 19000 units shortens the 800 ms request toward ~730;
+        // the correction appends frames past the main movement.
+        assert_between(last, 630, 1000, "drag total");
         // Progress crosses the midpoint near t=0.5 (minimum-jerk is symmetric).
         let half_frames = plan
             .frames
@@ -508,10 +788,162 @@ mod tests {
         for &(x, y, _) in &plan.frames {
             assert!(x <= 65535 && y <= 65535);
         }
-        // Release stays near the requested endpoint (scatter bounded).
+        // Release stays near the requested endpoint: residual correction error
+        // (<= 0.5% of distance after coverage), lateral drift at t=1, and the
+        // per-axis clamped Schmidt scatter.
         let release_offset =
             (f64::from(plan.release.0) - 20000.0).hypot(f64::from(plan.release.1) - 5000.0);
-        assert!(release_offset <= END_SCATTER_MAX_UNITS + DRAG_MICRO_SIGMA_UNITS * 3.0);
+        assert!(
+            release_offset <= 1100.0,
+            "release {release_offset} units from the endpoint"
+        );
+    }
+
+    #[test]
+    fn flick_profile_peaks_early_and_lifts_before_the_end() {
+        let mut h = Humanize::seeded(67);
+        // Swipe shape: 300 ms, no hold, long distance.
+        let plan = drag_plan(&mut h, 1000, 30000, 1000, 2000, 300, 0, 0);
+        assert!(plan.frames.len() >= 10, "too few flick frames: {}", plan.frames.len());
+        let mut last = 0;
+        for &(_, _, at_ms) in &plan.frames {
+            assert!(at_ms > last, "flick deadline {at_ms} not after {last}");
+            last = at_ms;
+        }
+        assert_between(last, 250, 380, "flick contact time");
+        let final_progress = f64::from(30000 - plan.frames.last().unwrap().1) / 28000.0;
+        assert!(
+            (0.7..=1.0).contains(&final_progress),
+            "flick must lift before covering the full distance: {final_progress}"
+        );
+        // Velocity peaks early: the first third covers more than the last third.
+        let third = plan.frames.len() / 3;
+        let travelled = |frame: (u16, u16, u64)| f64::from(30000 - frame.1);
+        let early = travelled(plan.frames[third]) - travelled(plan.frames[0]);
+        let late = travelled(*plan.frames.last().unwrap())
+            - travelled(plan.frames[plan.frames.len() - 1 - third]);
+        assert!(early > late, "flick should decelerate: early {early} vs late {late}");
+    }
+
+    #[test]
+    fn aiming_drags_correct_with_an_undershoot_bias() {
+        // Count correction records from the debug dump: ~25% undershoot plus
+        // ~10% overshoot across seeded runs, undershoot always dominant.
+        let dir = std::env::temp_dir().join(format!("poki-humanize-corr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("debug.jsonl");
+        let runs = 120;
+        {
+            let mut h = Humanize {
+                enabled: true,
+                state: 71,
+                spare_normal: None,
+                debug_path: Some(path.to_string_lossy().into_owned()),
+            };
+            for _ in 0..runs {
+                let plan = drag_plan(&mut h, 0, 5000, 30000, 5000, 800, 600, 0);
+                let mut last = 0;
+                for &(_, _, at_ms) in &plan.frames {
+                    assert!(at_ms > last, "deadline {at_ms} not after {last}");
+                    last = at_ms;
+                }
+                // Every plan ends within a small band of the target: the
+                // correction covers most of the miss and scatter is clamped.
+                let release_offset =
+                    (f64::from(plan.release.0) - 30000.0).hypot(f64::from(plan.release.1) - 5000.0);
+                assert!(release_offset <= 1100.0, "release {release_offset} units off target");
+            }
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let mut undershoots = 0usize;
+        let mut overshoots = 0usize;
+        for line in content.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            match record["correction"]["kind"].as_str() {
+                Some("undershoot") => undershoots += 1,
+                Some("overshoot") => overshoots += 1,
+                _ => {}
+            }
+        }
+        let corrections = undershoots + overshoots;
+        assert!(
+            corrections >= runs / 4 && corrections <= runs / 2,
+            "correction rate {corrections}/{runs} outside the expected band"
+        );
+        assert!(undershoots > overshoots, "humans undershoot more than they overshoot");
+    }
+
+    #[test]
+    fn fitts_pull_orders_long_reaches_after_short_ones() {
+        let mut short_totals = Vec::new();
+        let mut long_totals = Vec::new();
+        for seed in 100..140 {
+            let mut h = Humanize::seeded(seed);
+            let short = drag_plan(&mut h, 0, 5000, 5000, 5000, 800, 600, 0);
+            let mut h = Humanize::seeded(seed);
+            let long = drag_plan(&mut h, 0, 5000, 45000, 5000, 800, 600, 0);
+            short_totals.push(short.frames.last().unwrap().2);
+            long_totals.push(long.frames.last().unwrap().2);
+        }
+        let mean = |values: &[u64]| values.iter().sum::<u64>() as f64 / values.len() as f64;
+        assert!(
+            mean(&long_totals) > mean(&short_totals) + 80.0,
+            "Fitts pull did not separate distances: short {} vs long {}",
+            mean(&short_totals),
+            mean(&long_totals)
+        );
+    }
+
+    #[test]
+    fn curvature_weights_slow_tight_segments_and_keep_straight_paths_plain() {
+        let straight = vec![(0.0, 0.0), (100.0, 0.0), (200.0, 0.0), (300.0, 0.0)];
+        let weights = curvature_weights(&straight);
+        assert_eq!(weights, vec![1.0, 1.0, 1.0, 1.0]);
+        let arced = vec![(0.0, 0.0), (100.0, 8.0), (200.0, 24.0), (300.0, 30.0)];
+        let weights = curvature_weights(&arced);
+        assert_eq!(weights.len(), 4);
+        let max_weight = weights.iter().cloned().fold(1.0, f64::max);
+        assert!(max_weight > 1.05, "arc weight {max_weight} did not slow the curve");
+        let min_weight = weights.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!((1.0..=1.0 + CURVATURE_WARP_MAX).contains(&min_weight));
+    }
+
+    #[test]
+    fn repeat_bursts_start_faster_and_stay_in_bounds() {
+        let mut h = Humanize::seeded(83);
+        let sample_median = |samples: &mut Vec<u64>| {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        };
+        // Log-normal gaps are heavy-tailed; medians, not means, carry the
+        // ordering signal.
+        let mut isolated = Vec::new();
+        let mut first_repeat = Vec::new();
+        let mut settled_repeat = Vec::new();
+        for _ in 0..240 {
+            isolated.push(key_gap_ms(&mut h));
+            first_repeat.push(key_repeat_gap_ms(&mut h, 1));
+            settled_repeat.push(key_repeat_gap_ms(&mut h, 4));
+        }
+        for &(index, value) in &[
+            ("isolated", sample_median(&mut isolated)),
+            ("first repeat", sample_median(&mut first_repeat)),
+            ("settled repeat", sample_median(&mut settled_repeat)),
+        ] {
+            assert_between(value, KEY_REPEAT_MIN_MS, KEY_GAP_MAX_MS, index);
+        }
+        let isolated_median = sample_median(&mut isolated);
+        let first_median = sample_median(&mut first_repeat);
+        let settled_median = sample_median(&mut settled_repeat);
+        assert!(
+            first_median < isolated_median,
+            "first repeat median {first_median} not faster than isolated {isolated_median}"
+        );
+        assert!(
+            settled_median <= first_median,
+            "repeat bursts should accelerate: settled {settled_median} > first {first_median}"
+        );
     }
 
     #[test]
@@ -567,6 +999,28 @@ mod tests {
             (120.0 * BUTTON_INTERVAL_MIN_FACTOR) as u64,
             (120.0 * BUTTON_INTERVAL_MAX_FACTOR).ceil() as u64,
             "button interval",
+        );
+    }
+
+    #[test]
+    fn normal_samples_are_symmetric_around_zero() {
+        // Guards the Box-Muller spare pairing: a non-symmetric spare (for
+        // example sin(angle/2)) shifts every log-normal median upward.
+        let mut h = Humanize::seeded(97);
+        let mut values = Vec::new();
+        for _ in 0..4000 {
+            values.push(h.normal());
+        }
+        values.sort_by(f64::total_cmp);
+        let median = values[values.len() / 2];
+        assert!(median.abs() < 0.08, "normal median {median} not centered on zero");
+        let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
+        assert!(mean.abs() < 0.08, "normal mean {mean} not centered on zero");
+        // Positive and negative draws must be roughly balanced.
+        let positive = values.iter().filter(|&&v| v > 0.0).count();
+        assert!(
+            (1800..=2200).contains(&positive),
+            "positive share {positive}/4000 not balanced"
         );
     }
 

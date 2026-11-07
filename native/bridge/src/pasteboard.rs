@@ -93,7 +93,7 @@ pub async fn paste_text(
             ));
         }
         if submit {
-            chord(keyboard, 0x28, &[], h).await?;
+            chord(keyboard, 0x28, &[], h, 0).await?;
         }
         return Ok(completed(0, submit, true, &baseline));
     }
@@ -178,7 +178,7 @@ pub async fn paste_text(
     client.send_object(xpc!({"command":"SET","pasteboardName":"general","items":new_items,"sourceMetadata":XPCObject::Null}),true).await?;
     check_reply(&client.recv().await?)?;
     super::trace("paste command V");
-    if chord(keyboard, 0x19, &[0xe3], h).await.is_err() {
+    if chord(keyboard, 0x19, &[0xe3], h, 0).await.is_err() {
         return Ok(clipboard_result(
             unconfirmed("paste_dispatch_unconfirmed", true, true),
             snapshot_status,
@@ -243,7 +243,7 @@ pub async fn paste_text(
         ));
     }
     if submit {
-        chord(keyboard, 0x28, &[], h).await?;
+        chord(keyboard, 0x28, &[], h, 0).await?;
     }
     Ok(clipboard_result(
         noting_answer(completed(characters, submit, restored, &baseline), answered),
@@ -697,8 +697,8 @@ async fn clear_text(keyboard: &mut Keyboard, h: &mut Humanize) -> Result<()> {
     // The first selection may cover an IME composition only. Repeat once
     // after it resolves to clear the committed field as well.
     for _ in 0..2 {
-        chord(keyboard, 0x04, &[0xe3], h).await?;
-        chord(keyboard, 0x2a, &[], h).await?;
+        chord(keyboard, 0x04, &[0xe3], h, 0).await?;
+        chord(keyboard, 0x2a, &[], h, 0).await?;
     }
     Ok(())
 }

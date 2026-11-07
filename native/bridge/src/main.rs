@@ -481,8 +481,8 @@ async fn execute_connected(
                     .map(|m| modifier_usage(m))
                     .collect::<Result<Vec<_>>>()?;
                 let outcome: Result<()> = async {
-                    for _ in 0..count {
-                        chord(&mut keyboard, key_usage(&key)?, &usages, &mut humanize).await?;
+                    for index in 0..count {
+                        chord(&mut keyboard, key_usage(&key)?, &usages, &mut humanize, index).await?;
                     }
                     Ok(())
                 }
@@ -634,6 +634,7 @@ async fn chord(
     key: u64,
     modifiers: &[u64],
     h: &mut humanize::Humanize,
+    repeat_index: usize,
 ) -> Result<()> {
     let pressed = modifiers
         .iter()
@@ -643,7 +644,11 @@ async fn chord(
     let lead = humanize::modifier_lead_ms(h);
     let hold = humanize::key_hold_ms(h);
     let tail = humanize::modifier_tail_ms(h);
-    let gap = humanize::key_gap_ms(h);
+    let gap = if repeat_index == 0 {
+        humanize::key_gap_ms(h)
+    } else {
+        humanize::key_repeat_gap_ms(h, repeat_index)
+    };
     let result: Result<()> = async {
         for usage in &pressed {
             keyboard
